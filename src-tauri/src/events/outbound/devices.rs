@@ -45,7 +45,9 @@ struct SetImageEvent {
 }
 
 pub async fn update_image(context: crate::shared::Context, image: Option<String>) -> Result<(), anyhow::Error> {
-	if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&context.device[..2]) {
+	if context.device.starts_with("99-") {
+		crate::mirajazz::update_image(&context, image.as_deref()).await?;
+	} else if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&context.device[..2]) {
 		send_to_plugin(
 			plugin,
 			&SetImageEvent {
@@ -65,7 +67,9 @@ pub async fn update_image(context: crate::shared::Context, image: Option<String>
 }
 
 pub async fn clear_screen(device: String) -> Result<(), anyhow::Error> {
-	if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&device[..2]) {
+	if device.starts_with("99-") {
+		crate::mirajazz::clear_screen(&device).await?;
+	} else if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&device[..2]) {
 		send_to_plugin(
 			plugin,
 			&SetImageEvent {
@@ -106,7 +110,9 @@ pub async fn set_device_brightness(device: &str, brightness: u8) -> Result<(), a
 		return Ok(());
 	}
 
-	if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&device[..2]) {
+	if device.starts_with("99-") {
+		crate::mirajazz::set_brightness(device, brightness).await;
+	} else if let Some(plugin) = DEVICE_NAMESPACES.read().await.get(&device[..2]) {
 		send_to_plugin(
 			plugin,
 			&SetBrightnessEvent {

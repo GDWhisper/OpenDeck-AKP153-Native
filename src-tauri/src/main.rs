@@ -5,6 +5,7 @@ mod application_watcher;
 mod device_sleep;
 mod elgato;
 mod events;
+mod mirajazz;
 mod plugins;
 mod power_events;
 mod shared;
@@ -192,6 +193,7 @@ If you have already donated, thank you so much for your support!"#,
 			tokio::spawn(async {
 				loop {
 					elgato::initialise_devices().await;
+					mirajazz::initialise_mirajazz_devices().await;
 					tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 				}
 			});
@@ -380,6 +382,7 @@ If you have already donated, thank you so much for your support!"#,
 			#[cfg(windows)]
 			futures::executor::block_on(plugins::deactivate_plugins());
 			tokio::spawn(elgato::reset_devices());
+			tokio::spawn(mirajazz::reset_devices());
 			use tauri_plugin_aptabase::EventTracker;
 			app.flush_events_blocking();
 		}
