@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, LazyLock};
 
+use dashmap::DashMap;
 use dashmap::DashSet;
 use futures::FutureExt;
 use mirajazz::device::{Device, DeviceQuery, list_devices};
@@ -30,6 +31,19 @@ const ENCODER_COUNT: usize = 0;
 static MIRAJAZZ_DEVICES: LazyLock<RwLock<HashMap<String, Arc<Device>>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 
 static WEDGED_DEVICES: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+static FLUSH_SIGNALS: LazyLock<DashMap<String, tokio::sync::mpsc::Sender<()>>> = LazyLock::new(DashMap::new);
+
+/// Per-device generation counter. Incremented when a new init task takes over
+/// (e.g. after resume from sleep). Old init tasks check this before cleanup
+/// to avoid deregistering a device that a newer init has registered.
+static DEVICE_GENERATIONS: LazyLock<DashMap<String, u64>> = LazyLock::new(DashMap::new);
+
+const FLUSH_DEBOUNCE_MS: u64 = 200;
+
+/// Reader read timeout. Must be finite so the event loop can
+/// detect wedge/resume signals instead of blocking forever.
+const READER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const OPENDECK_TO_DEVICE: [u8; 18] = [12, 9, 6, 3, 0, 15, 13, 10, 7, 4, 1, 16, 14, 11, 8, 5, 2, 17];
 
@@ -89,6 +103,23 @@ async fn setup_device(device: &Device, _device_id: &str) -> Result<Arc<DeviceSta
 fn handle_wedge(device_id: &str) {
 	log::error!("mirajazz [{device_id}]: marking device as wedged, will be reconnected by polling loop");
 	WEDGED_DEVICES.insert(device_id.to_owned());
+	cleanup_device_state(device_id);
+}
+
+fn cleanup_device_state(device_id: &str) {
+	FLUSH_SIGNALS.remove(device_id);
+}
+
+/// Bump the generation counter for a device. Returns the new generation.
+fn bump_generation(device_id: &str) -> u64 {
+	let mut entry = DEVICE_GENERATIONS.entry(device_id.to_owned()).or_insert(0);
+	*entry.value_mut() += 1;
+	*entry.value()
+}
+
+/// Check if the current init task is still the active one for this device.
+fn is_current_generation(device_id: &str, generation: u64) -> bool {
+	DEVICE_GENERATIONS.get(device_id).map(|g| *g.value() == generation).unwrap_or(false)
 }
 
 async fn safe_hid_op<T>(device_id: &str, op: impl Future<Output = Result<T, MirajazzError>>) -> Option<T> {
@@ -115,12 +146,47 @@ async fn safe_hid_op<T>(device_id: &str, op: impl Future<Output = Result<T, Mira
 	}
 }
 
-async fn try_reconnect(device_id: &str) -> Option<Arc<DeviceStateReader>> {
+fn signal_flush(device_id: &str) {
+	if let Some(tx) = FLUSH_SIGNALS.get(device_id) {
+		let _ = tx.try_send(());
+	}
+}
+
+async fn flush_task(device: Arc<Device>, device_id: String, mut rx: tokio::sync::mpsc::Receiver<()>) {
+	loop {
+		if rx.recv().await.is_none() {
+			break;
+		}
+
+		tokio::time::sleep(std::time::Duration::from_millis(FLUSH_DEBOUNCE_MS)).await;
+		while rx.try_recv().is_ok() {}
+
+		if WEDGED_DEVICES.contains(&device_id) {
+			continue;
+		}
+
+		safe_hid_op(&device_id, device.flush()).await;
+	}
+}
+
+fn start_flush_task(device_id: &str, device: Arc<Device>) {
+	let (tx, rx) = tokio::sync::mpsc::channel(64);
+	FLUSH_SIGNALS.insert(device_id.to_owned(), tx);
+	tokio::spawn(flush_task(device, device_id.to_owned(), rx));
+}
+
+async fn try_reconnect(device_id: &str, generation: u64) -> Option<Arc<DeviceStateReader>> {
 	if let Some(old_device) = MIRAJAZZ_DEVICES.write().await.remove(device_id) {
 		drop(old_device);
 	}
+	cleanup_device_state(device_id);
 
 	for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+		if !is_current_generation(device_id, generation) {
+			log::info!("mirajazz [{device_id}]: newer generation detected, aborting reconnect");
+			return None;
+		}
+
 		log::info!("mirajazz [{device_id}]: reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS}");
 		tokio::time::sleep(RECONNECT_DELAY).await;
 
@@ -161,7 +227,9 @@ async fn try_reconnect(device_id: &str) -> Option<Arc<DeviceStateReader>> {
 		match connect_result {
 			Ok(Ok(Ok((new_device, reader)))) => {
 				WEDGED_DEVICES.remove(device_id);
-				MIRAJAZZ_DEVICES.write().await.insert(device_id.to_owned(), Arc::new(new_device));
+				let new_device = Arc::new(new_device);
+				MIRAJAZZ_DEVICES.write().await.insert(device_id.to_owned(), new_device.clone());
+				start_flush_task(device_id, new_device);
 				log::info!("mirajazz [{device_id}]: reconnected successfully");
 				return Some(reader);
 			}
@@ -182,6 +250,8 @@ async fn try_reconnect(device_id: &str) -> Option<Arc<DeviceStateReader>> {
 }
 
 async fn init(device: Arc<Device>, device_id: String) {
+	let generation = bump_generation(&device_id);
+
 	let reader = match tokio::time::timeout(CONNECT_TIMEOUT, AssertUnwindSafe(setup_device(&device, &device_id)).catch_unwind()).await {
 		Ok(Ok(Ok(reader))) => reader,
 		Ok(Ok(Err(e))) => {
@@ -199,7 +269,8 @@ async fn init(device: Arc<Device>, device_id: String) {
 		}
 	};
 
-	MIRAJAZZ_DEVICES.write().await.insert(device_id.clone(), device);
+	MIRAJAZZ_DEVICES.write().await.insert(device_id.clone(), device.clone());
+	start_flush_task(&device_id, device);
 
 	if let Err(e) = inbound::devices::register_device(
 		"",
@@ -221,6 +292,7 @@ async fn init(device: Arc<Device>, device_id: String) {
 	{
 		log::error!("mirajazz [{device_id}]: register_device failed: {e}");
 		MIRAJAZZ_DEVICES.write().await.remove(&device_id);
+		cleanup_device_state(&device_id);
 		return;
 	}
 
@@ -237,7 +309,12 @@ async fn init(device: Arc<Device>, device_id: String) {
 			break;
 		}
 
-		let updates = match AssertUnwindSafe(reader.read(None)).catch_unwind().await {
+		if !is_current_generation(&device_id, generation) {
+			log::info!("mirajazz [{device_id}]: newer generation detected, exiting event loop");
+			break;
+		}
+
+		let updates = match AssertUnwindSafe(reader.read(Some(READER_TIMEOUT))).catch_unwind().await {
 			Ok(Ok(updates)) => updates,
 			Ok(Err(e)) => {
 				if matches!(e, MirajazzError::ImageError(_) | MirajazzError::BadData) {
@@ -247,7 +324,7 @@ async fn init(device: Arc<Device>, device_id: String) {
 
 				log::warn!("mirajazz [{device_id}]: fatal reader error: {e}, attempting reconnect");
 
-				match try_reconnect(&device_id).await {
+				match try_reconnect(&device_id, generation).await {
 					Some(new_reader) => {
 						reader = new_reader;
 						continue;
@@ -274,12 +351,18 @@ async fn init(device: Arc<Device>, device_id: String) {
 		}
 	}
 
-	MIRAJAZZ_DEVICES.write().await.remove(&device_id);
-	WEDGED_DEVICES.remove(&device_id);
-	if let Err(e) = inbound::devices::deregister_device("", inbound::PayloadEvent { payload: device_id.clone() }).await {
-		log::warn!("mirajazz [{device_id}]: deregister_device failed: {e}");
+	if is_current_generation(&device_id, generation) {
+		MIRAJAZZ_DEVICES.write().await.remove(&device_id);
+		WEDGED_DEVICES.remove(&device_id);
+		cleanup_device_state(&device_id);
+		if let Err(e) = inbound::devices::deregister_device("", inbound::PayloadEvent { payload: device_id.clone() }).await {
+			log::warn!("mirajazz [{device_id}]: deregister_device failed: {e}");
+		}
+	} else {
+		log::info!("mirajazz [{device_id}]: stale init (gen {generation}), skipping cleanup");
 	}
-	log::info!("mirajazz [{device_id}]: device task ended");
+
+	log::info!("mirajazz [{device_id}]: device task ended (gen {generation})");
 }
 
 pub async fn initialise_mirajazz_devices() {
@@ -324,6 +407,30 @@ pub async fn initialise_mirajazz_devices() {
 	}
 }
 
+/// Called on system resume from sleep/hibernate.
+/// After sleep, USB HID handles are invalidated and async-hid's I/O buffers
+/// are in a broken state. We bump the generation counter so old init tasks
+/// skip cleanup, then clear the device map so the 10s polling loop reconnects.
+pub async fn resume_from_sleep() {
+	let device_ids: Vec<String> = MIRAJAZZ_DEVICES.read().await.keys().cloned().collect();
+
+	for device_id in &device_ids {
+		log::info!("mirajazz [{device_id}]: bumping generation for resume from sleep");
+		bump_generation(device_id);
+		WEDGED_DEVICES.remove(device_id);
+	}
+
+	if !device_ids.is_empty() {
+		let mut devices = MIRAJAZZ_DEVICES.write().await;
+		devices.clear();
+	}
+
+	log::info!("mirajazz: all AKP153 devices cleared for reconnection after system resume");
+}
+
+/// Set or clear a button image on a mirajazz device.
+/// Only writes to the device's internal image cache; the debounce flush task
+/// will send the cached images to the device in a single batched flush.
 pub async fn update_image(context: &crate::shared::Context, image: Option<&str>) -> Result<(), anyhow::Error> {
 	let device = {
 		let devices = MIRAJAZZ_DEVICES.read().await;
@@ -348,9 +455,13 @@ pub async fn update_image(context: &crate::shared::Context, image: Option<&str>)
 		} else {
 			device.clear_button_image(opendeck_to_device(context.position)).await?;
 		}
-		device.flush().await
+		Ok::<(), MirajazzError>(())
 	})
 	.await;
+
+	if result.is_some() {
+		signal_flush(&context.device);
+	}
 
 	if result.is_none() && WEDGED_DEVICES.contains(&context.device) {
 		return Err(anyhow::anyhow!("device wedged"));
@@ -358,6 +469,8 @@ pub async fn update_image(context: &crate::shared::Context, image: Option<&str>)
 	Ok(())
 }
 
+/// Clear the entire screen of a mirajazz device.
+/// Flushes immediately since this is an infrequent operation.
 pub async fn clear_screen(id: &str) -> Result<(), anyhow::Error> {
 	let device = {
 		let devices = MIRAJAZZ_DEVICES.read().await;
@@ -366,16 +479,17 @@ pub async fn clear_screen(id: &str) -> Result<(), anyhow::Error> {
 
 	let Some(device) = device else { return Ok(()) };
 
-	let op = async {
+	safe_hid_op(id, async {
 		device.clear_all_button_images().await?;
 		device.flush().await?;
 		Ok::<(), MirajazzError>(())
-	};
-
-	safe_hid_op(id, op).await;
+	})
+	.await;
 	Ok(())
 }
 
+/// Set the brightness of a mirajazz device.
+/// Brightness is a direct HID write (no cache), so no flush needed.
 pub async fn set_brightness(id: &str, brightness: u8) {
 	let device = {
 		let devices = MIRAJAZZ_DEVICES.read().await;
@@ -384,20 +498,19 @@ pub async fn set_brightness(id: &str, brightness: u8) {
 
 	let Some(device) = device else { return };
 
-	let op = async {
-		device.set_brightness(brightness.clamp(0, 100)).await?;
-		device.flush().await?;
-		Ok::<(), MirajazzError>(())
-	};
-
-	safe_hid_op(id, op).await;
+	safe_hid_op(id, device.set_brightness(brightness.clamp(0, 100))).await;
 }
 
+/// Reset all connected mirajazz devices (called on app exit).
 pub async fn reset_devices() {
 	let devices: Vec<Arc<Device>> = MIRAJAZZ_DEVICES.read().await.values().cloned().collect();
 
 	for device in devices {
-		let _ = device.reset().await;
-		let _ = device.flush().await;
+		let _ = AssertUnwindSafe(async {
+			let _ = device.reset().await;
+			let _ = device.flush().await;
+		})
+		.catch_unwind()
+		.await;
 	}
 }

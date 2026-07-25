@@ -30,6 +30,7 @@ pub fn init_power_events() {
 						if let Err(error) = crate::events::outbound::misc::system_did_wake_up().await {
 							log::error!("Failed to send the systemDidWakeUp event: {error}");
 						}
+						crate::mirajazz::resume_from_sleep().await;
 					});
 				}
 				PowerState::Suspend | PowerState::Shutdown | PowerState::Unknown => {}
