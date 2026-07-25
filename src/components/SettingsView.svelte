@@ -73,7 +73,7 @@
 				<select bind:value={$settings.language} class="w-32" id="settings-language">
 					<option value="en">English</option>
 					<option value="es">Español</option>
-					<option value="zh_CN">中文</option>
+					<option value="zh">中文</option>
 					<option value="fr">Français</option>
 					<option value="de">Deutsch</option>
 					<option value="ja">日本語</option>
