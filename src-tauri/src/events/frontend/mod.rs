@@ -50,7 +50,7 @@ impl From<anyhow::Error> for Error {
 
 #[command]
 pub async fn restart(app: tauri::AppHandle) {
-	app.restart();
+	crate::restart_app(&app);
 }
 
 #[command]

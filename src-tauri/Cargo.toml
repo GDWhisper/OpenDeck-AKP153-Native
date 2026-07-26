@@ -61,7 +61,7 @@ psp = { git = "https://github.com/pewsheen/psp", rev = "d2936425122e26822a2c126e
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = "0.61"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

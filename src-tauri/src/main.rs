@@ -54,8 +54,68 @@ fn hide_window(app: &AppHandle) -> Result<(), tauri::Error> {
 	Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn wait_for_process_exit(pid: u32) {
+	use windows_sys::Win32::Foundation::CloseHandle;
+	use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+	const SYNCHRONIZE: u32 = 0x00100000;
+
+	unsafe {
+		let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+		if !handle.is_null() {
+			WaitForSingleObject(handle, 30_000);
+			CloseHandle(handle);
+		}
+	}
+}
+
+fn restart_app(app: &AppHandle) {
+	#[cfg(target_os = "windows")]
+	{
+		let exe = match std::env::current_exe() {
+			Ok(exe) => exe,
+			Err(e) => {
+				log::error!("Failed to get current executable path for restart: {e}");
+				app.exit(1);
+				return;
+			}
+		};
+		let pid = std::process::id();
+
+		if let Err(e) = std::process::Command::new(&exe)
+			.arg("--restart-helper")
+			.arg(pid.to_string())
+			.spawn()
+		{
+			log::error!("Failed to spawn restart helper: {e}");
+			app.exit(1);
+			return;
+		}
+
+		app.exit(0);
+	}
+
+	#[cfg(not(target_os = "windows"))]
+	app.restart();
+}
+
 #[tokio::main]
 async fn main() {
+	#[cfg(target_os = "windows")]
+	if let Some(pos) = std::env::args().position(|x| x == "--restart-helper") {
+		let args: Vec<_> = std::env::args().collect();
+		if args.len() > pos + 1 {
+			if let Ok(pid) = args[pos + 1].parse::<u32>() {
+				wait_for_process_exit(pid);
+			}
+		}
+		if let Ok(exe) = std::env::current_exe() {
+			let _ = std::process::Command::new(exe).spawn();
+		}
+		return;
+	}
+
 	log_panics::init();
 	let _ = fix_path_env::fix();
 
@@ -231,7 +291,7 @@ If you have already donated, thank you so much for your support!"#,
 					let _ = match event.id().as_ref() {
 						"show" => show_window(app),
 						"hide" => hide_window(app),
-						"restart" => app.restart(),
+						"restart" => { restart_app(app); Ok(()) }
 						"quit" => {
 							app.exit(0);
 							Ok(())
