@@ -65,3 +65,6 @@ windows-sys = "0.61"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+[patch.crates-io]
+async-hid = { path = "../patches/async-hid-0.5.3" }

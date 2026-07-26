@@ -39,6 +39,10 @@ static FLUSH_SIGNALS: LazyLock<DashMap<String, tokio::sync::mpsc::Sender<()>>> =
 /// to avoid deregistering a device that a newer init has registered.
 static DEVICE_GENERATIONS: LazyLock<DashMap<String, u64>> = LazyLock::new(DashMap::new);
 
+/// Tracks device IDs that currently have an active init task running.
+/// Prevents spawning duplicate init tasks that would open competing HID handles.
+static ACTIVE_INIT_TASKS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
 const FLUSH_DEBOUNCE_MS: u64 = 200;
 
 /// Reader read timeout. Must be finite so the event loop can
@@ -92,11 +96,15 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-async fn setup_device(device: &Device, _device_id: &str) -> Result<Arc<DeviceStateReader>, MirajazzError> {
+async fn setup_device(device: &Device, device_id: &str) -> Result<Arc<DeviceStateReader>, MirajazzError> {
+	log::info!("mirajazz [{device_id}]: setup step 1/4: clear_all_button_images");
 	device.clear_all_button_images().await?;
+	log::info!("mirajazz [{device_id}]: setup step 2/4: set_brightness");
 	let brightness = crate::store::get_settings().value.brightness;
 	device.set_brightness(brightness).await?;
+	log::info!("mirajazz [{device_id}]: setup step 3/4: flush");
 	device.flush().await?;
+	log::info!("mirajazz [{device_id}]: setup step 4/4: get_reader");
 	Ok(device.get_reader(process_input))
 }
 
@@ -252,20 +260,48 @@ async fn try_reconnect(device_id: &str, generation: u64) -> Option<Arc<DeviceSta
 async fn init(device: Arc<Device>, device_id: String) {
 	let generation = bump_generation(&device_id);
 
+
+	let result = init_inner(device, device_id.clone(), generation).await;
+
+	if !is_current_generation(&device_id, generation) {
+		log::info!("mirajazz [{device_id}]: stale init (gen {generation}), skipping cleanup");
+		DEVICE_GENERATIONS.remove_if(&device_id, |_, v| *v == generation);
+	} else {
+		if matches!(result, InitResult::Wedged) {
+			MIRAJAZZ_DEVICES.write().await.remove(&device_id);
+			WEDGED_DEVICES.remove(&device_id);
+			cleanup_device_state(&device_id);
+			if let Err(e) = inbound::devices::deregister_device("", inbound::PayloadEvent { payload: device_id.clone() }).await {
+				log::warn!("mirajazz [{device_id}]: deregister_device failed: {e}");
+			}
+		}
+		DEVICE_GENERATIONS.remove(&device_id);
+	}
+
+	ACTIVE_INIT_TASKS.remove(&device_id);
+	log::info!("mirajazz [{device_id}]: device task ended (gen {generation})");
+}
+
+enum InitResult {
+	NormalExit,
+	Wedged,
+}
+
+async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> InitResult {
 	let reader = match tokio::time::timeout(CONNECT_TIMEOUT, AssertUnwindSafe(setup_device(&device, &device_id)).catch_unwind()).await {
 		Ok(Ok(Ok(reader))) => reader,
 		Ok(Ok(Err(e))) => {
 			log::warn!("mirajazz [{device_id}]: initial setup failed: {e}");
-			return;
+			return InitResult::NormalExit;
 		}
 		Ok(Err(_panic)) => {
 			log::error!("mirajazz [{device_id}]: initial setup panicked (device likely wedged)");
 			handle_wedge(&device_id);
-			return;
+			return InitResult::Wedged;
 		}
 		Err(_) => {
 			log::warn!("mirajazz [{device_id}]: initial setup timed out");
-			return;
+			return InitResult::NormalExit;
 		}
 	};
 
@@ -293,7 +329,7 @@ async fn init(device: Arc<Device>, device_id: String) {
 		log::error!("mirajazz [{device_id}]: register_device failed: {e}");
 		MIRAJAZZ_DEVICES.write().await.remove(&device_id);
 		cleanup_device_state(&device_id);
-		return;
+		return InitResult::NormalExit;
 	}
 
 	log::info!("mirajazz [{device_id}]: device registered, entering event loop");
@@ -306,12 +342,12 @@ async fn init(device: Arc<Device>, device_id: String) {
 	loop {
 		if WEDGED_DEVICES.contains(&device_id) {
 			log::info!("mirajazz [{device_id}]: device wedged, exiting event loop");
-			break;
+			return InitResult::Wedged;
 		}
 
 		if !is_current_generation(&device_id, generation) {
 			log::info!("mirajazz [{device_id}]: newer generation detected, exiting event loop");
-			break;
+			return InitResult::NormalExit;
 		}
 
 		let updates = match AssertUnwindSafe(reader.read(Some(READER_TIMEOUT))).catch_unwind().await {
@@ -329,13 +365,13 @@ async fn init(device: Arc<Device>, device_id: String) {
 						reader = new_reader;
 						continue;
 					}
-					None => break,
+					None => return InitResult::NormalExit,
 				}
 			}
 			Err(_) => {
 				log::error!("mirajazz [{device_id}]: reader panicked (device likely wedged)");
 				handle_wedge(&device_id);
-				break;
+				return InitResult::Wedged;
 			}
 		};
 
@@ -350,19 +386,6 @@ async fn init(device: Arc<Device>, device_id: String) {
 			}
 		}
 	}
-
-	if is_current_generation(&device_id, generation) {
-		MIRAJAZZ_DEVICES.write().await.remove(&device_id);
-		WEDGED_DEVICES.remove(&device_id);
-		cleanup_device_state(&device_id);
-		if let Err(e) = inbound::devices::deregister_device("", inbound::PayloadEvent { payload: device_id.clone() }).await {
-			log::warn!("mirajazz [{device_id}]: deregister_device failed: {e}");
-		}
-	} else {
-		log::info!("mirajazz [{device_id}]: stale init (gen {generation}), skipping cleanup");
-	}
-
-	log::info!("mirajazz [{device_id}]: device task ended (gen {generation})");
 }
 
 pub async fn initialise_mirajazz_devices() {
@@ -389,19 +412,31 @@ pub async fn initialise_mirajazz_devices() {
 			continue;
 		}
 
-		if WEDGED_DEVICES.contains(&device_id) {
-			log::info!("mirajazz [{device_id}]: wedged device found, will retry after old handle is released");
+		if ACTIVE_INIT_TASKS.contains(&device_id) {
 			continue;
+		}
+
+		if WEDGED_DEVICES.contains(&device_id) {
+			if let Some(old) = MIRAJAZZ_DEVICES.write().await.remove(&device_id) {
+				drop(old);
+			}
+			WEDGED_DEVICES.remove(&device_id);
+			DEVICE_GENERATIONS.remove(&device_id);
+			log::info!("mirajazz [{device_id}]: cleared wedged state, will retry connection");
 		}
 
 		log::info!("mirajazz: discovered AKP153 (VID={:#06x} PID={:#06x}) → id={device_id}", dev.vendor_id, dev.product_id);
 
-		match Device::connect(dev, 1, KEY_COUNT, ENCODER_COUNT).await {
-			Ok(device) => {
+		match tokio::time::timeout(CONNECT_TIMEOUT, Device::connect(dev, 1, KEY_COUNT, ENCODER_COUNT)).await {
+			Ok(Ok(device)) => {
+				ACTIVE_INIT_TASKS.insert(device_id.clone());
 				tokio::spawn(init(Arc::new(device), device_id));
 			}
-			Err(error) => {
+			Ok(Err(error)) => {
 				log::warn!("mirajazz: failed to connect to AKP153 ({device_id}): {error}");
+			}
+			Err(_) => {
+				log::warn!("mirajazz: Device::connect timed out for {device_id}");
 			}
 		}
 	}
@@ -425,7 +460,14 @@ pub async fn resume_from_sleep() {
 		devices.clear();
 	}
 
-	log::info!("mirajazz: all AKP153 devices cleared for reconnection after system resume");
+	let ids_for_cleanup = device_ids.clone();
+	tokio::spawn(async move {
+		tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+		for device_id in &ids_for_cleanup {
+			DEVICE_GENERATIONS.remove(device_id);
+		}
+		log::info!("mirajazz: all AKP153 devices cleared for reconnection after system resume");
+	});
 }
 
 /// Set or clear a button image on a mirajazz device.
