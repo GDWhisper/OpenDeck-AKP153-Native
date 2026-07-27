@@ -1,4 +1,11 @@
 {
+	"bundle": {
+		"windows": {
+			"nsis": {
+				"installerHooks": "./bundle/akp153_power.nsh"
+			}
+		}
+	},
 	"app": {
 		"windows": [
 			{

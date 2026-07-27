@@ -12,7 +12,7 @@ use windows::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResul
 
 use crate::backend::win32::device::Device;
 use crate::backend::win32::waiter::HandleWaiter;
-use crate::HidResult;
+use crate::{HidError, HidResult};
 
 #[derive(Debug)]
 pub struct Readable;
@@ -72,7 +72,11 @@ impl<T> IoBuffer<T> {
     where
         F: FnOnce(&Device, &mut [u8], &mut Overlapped) -> windows::core::Result<()>
     {
-        assert!(!self.pending, "I/O operation already pending");
+        if self.pending {
+            // A previous operation is still owning the buffer. Never panic here:
+            // report the inconsistency as an error so callers can drop/reopen the device.
+            return Err(HidError::message("I/O operation already pending"));
+        }
         let result = operation(&self.device, &mut self.buffer, &mut self.overlapped);
         match result {
             Ok(_) => {
@@ -82,11 +86,15 @@ impl<T> IoBuffer<T> {
                 self.pending = true;
             }
             Err(err) => {
-                if let Err(err) = self.cancel_io() {
-                    self.pending = true;
-                    panic!("Failed to cancel I/O operation: {:?}", err);
-                } else {
-                    self.pending = false;
+                // Per Win32 overlapped semantics an error other than ERROR_IO_PENDING means
+                // the operation was never queued; cancel defensively but never panic.
+                match self.cancel_io() {
+                    Ok(()) => self.pending = false,
+                    Err(cancel_err) => {
+                        // Keep the buffer marked as pending so it is leaked (not reused) on drop.
+                        self.pending = true;
+                        error!("Failed to cancel I/O operation after failed start: {cancel_err:?}");
+                    }
                 }
                 return Err(err.into());
             }
@@ -108,7 +116,13 @@ impl<T> IoBuffer<T> {
         match result {
             Ok(()) => Ok(Some(bytes_transferred as usize)),
             Err(err) if err.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => Ok(None),
-            Err(err) => Err(err.into())
+            Err(err) => {
+                // The operation completed with an error, so the kernel no longer owns the buffer.
+                // Clearing `pending` here is critical: leaving it set poisons this buffer and
+                // makes every subsequent operation fail (previously: panic in start_io).
+                self.pending = false;
+                Err(err.into())
+            }
         }
     }
 }
@@ -117,15 +131,24 @@ impl<T> Drop for IoBuffer<T> {
     fn drop(&mut self) {
         if self.pending {
             trace!("Canceling pending I/O operation");
-            // SAFETY: If canceling the I/O operation fails, the buffer and overlapped structures are leaked before we panic to make sure they stay valid even after `Self` gets freed.
+            // SAFETY: The buffer and overlapped structs may only be freed once the kernel is done
+            // with them. If cancellation fails, leak them instead of panicking so a wedged device
+            // cannot take down the process.
             if let Err(err) = self.cancel_io() {
-                panic!("Failed to cancel I/O operation: {:?}", err);
-            } else {
-                unsafe {
-                    ManuallyDrop::drop(&mut self.buffer);
-                    ManuallyDrop::drop(&mut self.overlapped);
-                }
+                error!("Failed to cancel pending I/O operation, leaking buffers: {err:?}");
+                return;
             }
+            // CancelIoEx only requests cancellation; wait for the operation to actually finish
+            // before freeing the buffers to avoid a use-after-free.
+            let mut bytes_transferred = 0;
+            let _ = unsafe { GetOverlappedResult(self.device.handle(), self.overlapped.as_raw(), &mut bytes_transferred, true) };
+            self.pending = false;
+        }
+        // Free the buffers on the normal path too (previously they were leaked whenever
+        // no operation was pending, leaking an event handle per closed device).
+        unsafe {
+            ManuallyDrop::drop(&mut self.buffer);
+            ManuallyDrop::drop(&mut self.overlapped);
         }
     }
 }
@@ -146,7 +169,7 @@ impl IoBuffer<Readable> {
                     Some(size) => {
                         trace!("Completed read operation (retrieved {} bytes)", size);
                         let mut data = &self.buffer[..size];
-                        if data[0] == 0x0 {
+                        if !data.is_empty() && data[0] == 0x0 {
                             data = &data[1..];
                         }
                         let mut copy_len = data.len();

@@ -10,6 +10,8 @@ mod plugins;
 mod power_events;
 mod shared;
 mod store;
+#[cfg(windows)]
+mod usb_power;
 mod zip_extract;
 
 mod built_info {
@@ -347,6 +349,10 @@ If you have already donated, thank you so much for your support!"#,
 				.targets([Target::new(TargetKind::LogDir { file_name: None }), Target::new(TargetKind::Stdout)])
 				.level(log::LevelFilter::Info)
 				.level_for("opendeck", log::LevelFilter::Debug)
+				// Keep rotated logs instead of discarding them (default KeepOne wipes the
+				// previous file at 40KB, destroying evidence of device failures).
+				.max_file_size(5_000_000)
+				.rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
 				.build(),
 		)
 		.plugin(tauri_plugin_cors_fetch::init())

@@ -1,5 +1,11 @@
 # OpenDeck
 
+> [!IMPORTANT]
+> **本分支是 OpenDeck 的 MiraBox/Ajazz AKP153 原生化适配分支，专门针对 Windows 平台调优。**
+> 无需插件即可原生驱动 AKP153（VID 0x5548 / PID 0x6674），包含 async-hid Win32 写路径修复、HID 操作超时守护、睡眠唤醒自动重连以及 USB 增强电源管理自愈（防止固件挂起死锁）。
+>
+> **This branch adds native MiraBox/Ajazz AKP153 support to OpenDeck, tuned specifically for Windows** — including async-hid Win32 fixes, HID watchdog timeouts, sleep/resume auto-reconnection, and USB enhanced power management self-healing.
+
 Linux software for your Elgato Stream Deck
 
 ![Main menu](.github/readme/mainmenu.png)

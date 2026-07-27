@@ -96,6 +96,11 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Upper bound for any single HID operation. A wedged device can leave a write
+/// pending forever, silently freezing the flush task while the process stays
+/// healthy; a timeout converts that into a wedge + reconnect via the polling loop.
+const HID_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn setup_device(device: &Device, device_id: &str) -> Result<Arc<DeviceStateReader>, MirajazzError> {
 	log::info!("mirajazz [{device_id}]: setup step 1/4: clear_all_button_images");
 	device.clear_all_button_images().await?;
@@ -135,13 +140,24 @@ async fn safe_hid_op<T>(device_id: &str, op: impl Future<Output = Result<T, Mira
 		return None;
 	}
 
-	match AssertUnwindSafe(op).catch_unwind().await {
-		Ok(Ok(result)) => Some(result),
-		Ok(Err(e)) => {
+	match tokio::time::timeout(HID_OP_TIMEOUT, AssertUnwindSafe(op).catch_unwind()).await {
+		Ok(Ok(Ok(result))) => Some(result),
+		Ok(Ok(Err(e))) => {
 			log::warn!("mirajazz [{device_id}]: HID error: {e}");
 			None
 		}
-		Err(_) => {
+		Ok(Err(_panic)) => {
+			if WEDGED_DEVICES.contains(device_id) {
+				return None;
+			}
+			handle_wedge(device_id);
+			if let Some(device) = MIRAJAZZ_DEVICES.write().await.remove(device_id) {
+				drop(device);
+			}
+			None
+		}
+		Err(_elapsed) => {
+			log::error!("mirajazz [{device_id}]: HID operation timed out after {HID_OP_TIMEOUT:?}");
 			if WEDGED_DEVICES.contains(device_id) {
 				return None;
 			}
@@ -158,6 +174,21 @@ fn signal_flush(device_id: &str) {
 	if let Some(tx) = FLUSH_SIGNALS.get(device_id) {
 		let _ = tx.try_send(());
 	}
+}
+
+/// Ask the frontend to re-render and re-push all key images.
+/// Needed after any (re)connect because setup_device clears the screen and only
+/// self-refreshing actions (e.g. clocks) would repaint on their own; the old
+/// plugin achieved this by sending a rerenderImages event over WebSocket.
+fn request_rerender(device_id: &str) {
+	let device_id = device_id.to_owned();
+	tokio::spawn(async move {
+		if let Some(app) = crate::APP_HANDLE.get()
+			&& let Err(e) = crate::events::frontend::profiles::rerender_images(app).await
+		{
+			log::warn!("mirajazz [{device_id}]: rerender request failed: {e}");
+		}
+	});
 }
 
 async fn flush_task(device: Arc<Device>, device_id: String, mut rx: tokio::sync::mpsc::Receiver<()>) {
@@ -239,6 +270,7 @@ async fn try_reconnect(device_id: &str, generation: u64) -> Option<Arc<DeviceSta
 				MIRAJAZZ_DEVICES.write().await.insert(device_id.to_owned(), new_device.clone());
 				start_flush_task(device_id, new_device);
 				log::info!("mirajazz [{device_id}]: reconnected successfully");
+				request_rerender(device_id);
 				return Some(reader);
 			}
 			Ok(Ok(Err(e))) => {
@@ -333,6 +365,7 @@ async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> 
 	}
 
 	log::info!("mirajazz [{device_id}]: device registered, entering event loop");
+	request_rerender(&device_id);
 
 	let press = |position: u8| inbound::PayloadEvent {
 		payload: inbound::devices::PressPayload { device: device_id.clone(), position },
@@ -403,6 +436,11 @@ pub async fn initialise_mirajazz_devices() {
 		log::debug!("mirajazz: no AKP153 devices found");
 		return;
 	}
+
+	// AKP153 firmware deadlocks when Windows suspends it; self-heal the per-instance
+	// registry setting before (re)connecting. No-op once all instances are fixed.
+	#[cfg(windows)]
+	crate::usb_power::ensure_akp153_power_management();
 
 	for dev in &devices {
 		let serial = dev.serial_number.as_deref().unwrap_or("355499441494");
