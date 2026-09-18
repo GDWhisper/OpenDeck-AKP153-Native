@@ -88,7 +88,7 @@ pub async fn set_selected_profile(device: String, id: String) -> Result<(), Erro
 			}
 		}
 	}
-	store.save()?;
+	store.save_async().await?;
 
 	locks.device_stores.set_selected_profile(&device, id)?;
 

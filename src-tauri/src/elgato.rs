@@ -189,7 +189,13 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 		return;
 	}
 
-	let device_name = device.product().await.unwrap();
+	let device_name = match device.product().await {
+		Ok(name) => name,
+		Err(error) => {
+			log::error!("Failed to get product name of device {device_id}: {error}");
+			return;
+		}
+	};
 	let kind = device.kind();
 	let device_type = match kind {
 		Kind::Original | Kind::OriginalV2 | Kind::Mk2 | Kind::Mk2Scissor | Kind::Mk2Module => 0,
@@ -208,7 +214,7 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 	ELGATO_DEVICES.write().await.insert(device_id.clone(), device);
 	let _ = clear_screen(&device_id).await;
 
-	crate::events::inbound::devices::register_device(
+	if let Err(error) = crate::events::inbound::devices::register_device(
 		"",
 		crate::events::inbound::PayloadEvent {
 			payload: crate::shared::DeviceInfo {
@@ -225,7 +231,11 @@ async fn init(device: AsyncStreamDeck, device_id: String) {
 		},
 	)
 	.await
-	.unwrap();
+	{
+		log::error!("Failed to register device {device_id}: {error}");
+		ELGATO_DEVICES.write().await.remove(&device_id);
+		return;
+	}
 
 	let press = |position| inbound::PayloadEvent {
 		payload: inbound::devices::PressPayload { device: device_id.clone(), position },

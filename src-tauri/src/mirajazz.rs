@@ -289,15 +289,29 @@ async fn try_reconnect(device_id: &str, generation: u64) -> Option<Arc<DeviceSta
 	None
 }
 
-async fn init(device: Arc<Device>, device_id: String) {
-	let generation = bump_generation(&device_id);
+/// Owns an ACTIVE_INIT_TASKS entry so removal still happens if init unwinds.
+struct ActiveInitGuard(String);
 
+impl ActiveInitGuard {
+	fn claim(device_id: &str) -> Self {
+		ACTIVE_INIT_TASKS.insert(device_id.to_owned());
+		Self(device_id.to_owned())
+	}
+}
+
+impl Drop for ActiveInitGuard {
+	fn drop(&mut self) {
+		ACTIVE_INIT_TASKS.remove(&self.0);
+	}
+}
+
+async fn init(device: Arc<Device>, device_id: String, _active: ActiveInitGuard) {
+	let generation = bump_generation(&device_id);
 
 	let result = init_inner(device, device_id.clone(), generation).await;
 
 	if !is_current_generation(&device_id, generation) {
 		log::info!("mirajazz [{device_id}]: stale init (gen {generation}), skipping cleanup");
-		DEVICE_GENERATIONS.remove_if(&device_id, |_, v| *v == generation);
 	} else {
 		if matches!(result, InitResult::Wedged) {
 			MIRAJAZZ_DEVICES.write().await.remove(&device_id);
@@ -307,10 +321,9 @@ async fn init(device: Arc<Device>, device_id: String) {
 				log::warn!("mirajazz [{device_id}]: deregister_device failed: {e}");
 			}
 		}
-		DEVICE_GENERATIONS.remove(&device_id);
+		DEVICE_GENERATIONS.remove_if(&device_id, |_, v| *v == generation);
 	}
 
-	ACTIVE_INIT_TASKS.remove(&device_id);
 	log::info!("mirajazz [{device_id}]: device task ended (gen {generation})");
 }
 
@@ -467,8 +480,7 @@ pub async fn initialise_mirajazz_devices() {
 
 		match tokio::time::timeout(CONNECT_TIMEOUT, Device::connect(dev, 1, KEY_COUNT, ENCODER_COUNT)).await {
 			Ok(Ok(device)) => {
-				ACTIVE_INIT_TASKS.insert(device_id.clone());
-				tokio::spawn(init(Arc::new(device), device_id));
+				tokio::spawn(init(Arc::new(device), device_id.clone(), ActiveInitGuard::claim(&device_id)));
 			}
 			Ok(Err(error)) => {
 				log::warn!("mirajazz: failed to connect to AKP153 ({device_id}): {error}");
@@ -487,9 +499,10 @@ pub async fn initialise_mirajazz_devices() {
 pub async fn resume_from_sleep() {
 	let device_ids: Vec<String> = MIRAJAZZ_DEVICES.read().await.keys().cloned().collect();
 
+	let mut generations: Vec<(String, u64)> = Vec::with_capacity(device_ids.len());
 	for device_id in &device_ids {
 		log::info!("mirajazz [{device_id}]: bumping generation for resume from sleep");
-		bump_generation(device_id);
+		generations.push((device_id.clone(), bump_generation(device_id)));
 		WEDGED_DEVICES.remove(device_id);
 	}
 
@@ -498,13 +511,16 @@ pub async fn resume_from_sleep() {
 		devices.clear();
 	}
 
-	let ids_for_cleanup = device_ids.clone();
+	let cleared = generations.len();
 	tokio::spawn(async move {
 		tokio::time::sleep(std::time::Duration::from_secs(12)).await;
-		for device_id in &ids_for_cleanup {
-			DEVICE_GENERATIONS.remove(device_id);
+		for (device_id, generation) in &generations {
+			// Removing an entry a reconnect already re-bumped would kill that live generation.
+			if DEVICE_GENERATIONS.remove_if(device_id, |_, v| *v == *generation).is_some() {
+				log::info!("mirajazz [{device_id}]: gen {generation} not reconnected, cleared for the polling loop");
+			}
 		}
-		log::info!("mirajazz: all AKP153 devices cleared for reconnection after system resume");
+		log::info!("mirajazz: {cleared} AKP153 device(s) cleared for reconnection after system resume");
 	});
 }
 

@@ -9,6 +9,8 @@
 
 	import { invoke } from "@tauri-apps/api/core";
 	import { listen } from "@tauri-apps/api/event";
+	import type { UnlistenFn } from "@tauri-apps/api/event";
+	import { onDestroy } from "svelte";
 
 	let iframes: { [context: string]: HTMLIFrameElement } = {};
 	let iframeContainer: HTMLDivElement;
@@ -85,7 +87,16 @@
 		}
 	};
 
-	window.addEventListener("message", ({ data }) => {
+	let unlisteners: UnlistenFn[] = [];
+	let destroyed = false;
+	function keepUnlisten(promise: Promise<UnlistenFn>) {
+		void promise.then((unlisten) => {
+			if (destroyed) unlisten();
+			else unlisteners.push(unlisten);
+		});
+	}
+
+	function onWindowMessage({ data }: MessageEvent) {
 		if (data.event == "windowOpened") {
 			const iframe = iframes[data.payload];
 			iframe.style.position = "absolute";
@@ -159,7 +170,9 @@
 					iframes[data.payload.context]?.contentWindow?.postMessage({ event: "fetchError", payload: { id: data.payload.id, error } }, getWebserverUrl());
 				});
 		}
-	});
+	}
+
+	window.addEventListener("message", onWindowMessage);
 
 	const nonNull = <T,>(o: T | null): o is T => o != null;
 	$: instances = profile.keys
@@ -168,15 +181,24 @@
 		.concat(profile.sliders.filter(nonNull))
 		.concat(profile.infobars.filter(nonNull));
 
-	listen("plugin_reloaded", ({ payload }: { payload: string }) => {
-		for (const instance of instances) {
-			if (instance.action.plugin == payload && iframes[instance.context]) {
-				iframes[instance.context].src += "";
-				if ($inspectedInstance == instance.context) {
-					invoke("switch_property_inspector", { new: instance.context });
+	keepUnlisten(
+		listen("plugin_reloaded", ({ payload }: { payload: string }) => {
+			for (const instance of instances) {
+				if (instance.action.plugin == payload && iframes[instance.context]) {
+					iframes[instance.context].src += "";
+					if ($inspectedInstance == instance.context) {
+						invoke("switch_property_inspector", { new: instance.context });
+					}
 				}
 			}
-		}
+		}),
+	);
+
+	onDestroy(() => {
+		destroyed = true;
+		window.removeEventListener("message", onWindowMessage);
+		unlisteners.forEach((unlisten) => unlisten());
+		unlisteners = [];
 	});
 </script>
 

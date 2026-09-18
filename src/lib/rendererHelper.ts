@@ -39,6 +39,22 @@ export class CanvasLock {
 	}
 }
 
+const imageLoadTimeout = 10e3;
+
+function loadImage(image: HTMLImageElement): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Event("error")), imageLoadTimeout);
+		image.onload = () => {
+			clearTimeout(timeout);
+			resolve();
+		};
+		image.onerror = (event) => {
+			clearTimeout(timeout);
+			reject(event);
+		};
+	});
+}
+
 export async function renderImage(
 	canvas: HTMLCanvasElement | null,
 	slotContext: Context | null,
@@ -78,10 +94,7 @@ export async function renderImage(
 		image.crossOrigin = "anonymous";
 		image.src = processImage ? getImage(state.image, fallback) : state.image;
 		if (image.src == undefined) return;
-		await new Promise((resolve, reject) => {
-			image.onload = resolve;
-			image.onerror = reject;
-		});
+		await loadImage(image);
 
 		context.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -144,20 +157,24 @@ export async function renderImage(
 		const okImage = document.createElement("img");
 		okImage.crossOrigin = "anonymous";
 		okImage.src = "/ok.png";
-		await new Promise((resolve) => {
-			okImage.onload = resolve;
-		});
-		context.drawImage(okImage, 0, 0, canvas.width, canvas.height);
+		try {
+			await loadImage(okImage);
+			context.drawImage(okImage, 0, 0, canvas.width, canvas.height);
+		} catch {
+			// A failed overlay load is not drawn.
+		}
 	}
 
 	if (showAlert) {
 		const alertImage = document.createElement("img");
 		alertImage.crossOrigin = "anonymous";
 		alertImage.src = "/alert.png";
-		await new Promise((resolve) => {
-			alertImage.onload = resolve;
-		});
-		context.drawImage(alertImage, 0, 0, canvas.width, canvas.height);
+		try {
+			await loadImage(alertImage);
+			context.drawImage(alertImage, 0, 0, canvas.width, canvas.height);
+		} catch {
+			// A failed overlay load is not drawn.
+		}
 	}
 
 	// Make the image smaller while the button is pressed.
@@ -189,7 +206,11 @@ export async function resizeImage(source: string): Promise<string | undefined> {
 	const image = document.createElement("img");
 	image.crossOrigin = "anonymous";
 	image.src = source;
-	await new Promise((resolve) => (image.onload = resolve));
+	try {
+		await loadImage(image);
+	} catch {
+		return;
+	}
 
 	let xOffset = 0,
 		yOffset = 0;

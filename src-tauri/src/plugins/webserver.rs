@@ -32,12 +32,25 @@ pub async fn init_webserver(prefix: PathBuf) {
 	};
 
 	for request in server.incoming_requests() {
-		let mut url = urlencoding::decode(request.url()).unwrap().into_owned();
+		let raw_url = request.url().to_owned();
+		let mut url = match urlencoding::decode(&raw_url) {
+			Ok(url) => url.into_owned(),
+			Err(_) => {
+				let _ = request.respond(Response::empty(400));
+				continue;
+			}
+		};
 		if url.contains('?') {
 			url = url.split_once('?').unwrap().0.to_owned();
 		}
 		#[cfg(target_os = "windows")]
-		let url = url[1..].replace('/', "\\");
+		let url = match url.strip_prefix('/') {
+			Some(url) => url.replace('/', "\\"),
+			None => {
+				let _ = request.respond(Response::empty(400));
+				continue;
+			}
+		};
 		let path = Path::new(url.trim_end_matches("|opendeck_property_inspector").trim_end_matches("|opendeck_property_inspector_child"));
 
 		if !matches!(tokio::fs::try_exists(path).await, Ok(true)) {

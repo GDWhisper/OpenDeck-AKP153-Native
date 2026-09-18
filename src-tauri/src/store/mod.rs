@@ -90,38 +90,54 @@ where
 		}
 	}
 
+	/// Serialize the value, without touching the filesystem
+	fn serialise(&self) -> Result<String, anyhow::Error> {
+		Ok(serde_json::to_string_pretty(&T::into_value(&self.value)?)?)
+	}
+
 	/// Save the relevant Store as a file
 	pub fn save(&self) -> Result<(), anyhow::Error> {
-		fs::create_dir_all(self.path.parent().unwrap())?;
-
-		let contents = serde_json::to_string_pretty(&T::into_value(&self.value)?)?;
-
-		let temp_path = self.path.with_extension("json.temp");
-		let backup_path = self.path.with_extension("json.bak");
-
-		// Write to temporary file
-		let mut temp_file = fs::OpenOptions::new().write(true).truncate(true).create(true).open(&temp_path)?;
-		temp_file.lock()?;
-		temp_file.write_all(contents.as_bytes())?;
-		temp_file.sync_data()?;
-		temp_file.unlock()?;
-		drop(temp_file);
-
-		// If main file exists, back it up
-		if self.path.exists() {
-			fs::rename(&self.path, &backup_path)?;
-		}
-
-		// Rename temp file to main file
-		fs::rename(&temp_path, &self.path)?;
-
-		// Remove backup file if everything succeeded
-		if backup_path.exists() {
-			let _ = fs::remove_file(&backup_path);
-		}
-
-		Ok(())
+		let contents = self.serialise()?;
+		write_store(&self.path, &contents)
 	}
+
+	/// Save the relevant Store as a file, with the blocking filesystem operations kept off the async executor
+	pub async fn save_async(&self) -> Result<(), anyhow::Error> {
+		let contents = self.serialise()?;
+		let path = self.path.clone();
+		tokio::task::spawn_blocking(move || write_store(&path, &contents)).await?
+	}
+}
+
+/// The shared filesystem half of `Store::save` and `Store::save_async`
+fn write_store(path: &Path, contents: &str) -> Result<(), anyhow::Error> {
+	fs::create_dir_all(path.parent().unwrap())?;
+
+	let temp_path = path.with_extension("json.temp");
+	let backup_path = path.with_extension("json.bak");
+
+	// Write to temporary file
+	let mut temp_file = fs::OpenOptions::new().write(true).truncate(true).create(true).open(&temp_path)?;
+	temp_file.lock()?;
+	temp_file.write_all(contents.as_bytes())?;
+	temp_file.sync_data()?;
+	temp_file.unlock()?;
+	drop(temp_file);
+
+	// If main file exists, back it up
+	if path.exists() {
+		fs::rename(path, &backup_path)?;
+	}
+
+	// Rename temp file to main file
+	fs::rename(&temp_path, path)?;
+
+	// Remove backup file if everything succeeded
+	if backup_path.exists() {
+		let _ = fs::remove_file(&backup_path);
+	}
+
+	Ok(())
 }
 
 #[derive(Serialize, Deserialize)]

@@ -137,13 +137,26 @@ impl From<ActionInstance> for DiskActionInstance {
 	}
 }
 
+/// Strip the storage suffix of a path-derived profile id, including the ones used for recovery
+fn strip_storage_suffix(id: &str) -> &str {
+	if let Some(stripped) = id.strip_suffix(".json.bak") {
+		stripped
+	} else if let Some(stripped) = id.strip_suffix(".json.temp") {
+		stripped
+	} else if let Some(stripped) = id.strip_suffix(".json") {
+		stripped
+	} else {
+		id
+	}
+}
+
 impl DiskActionInstance {
 	fn into_action_instance(self, path: &Path) -> ActionInstance {
 		let config_dir = crate::shared::config_dir();
 		let mut iter = path.strip_prefix(&config_dir).unwrap().iter();
 		let device = iter.nth(1).unwrap().to_string_lossy().into_owned();
-		let mut profile = iter.map(|x| x.to_string_lossy()).collect::<Vec<_>>().join("/");
-		profile = profile[..profile.len() - 5].to_owned();
+		let id = iter.map(|x| x.to_string_lossy()).collect::<Vec<_>>().join("/");
+		let profile = strip_storage_suffix(&id).to_owned();
 
 		let reconstruct_path = |value: &str| -> String {
 			if !(value.is_empty() || value.starts_with("data:") || value.starts_with("opendeck/")) {
@@ -209,10 +222,9 @@ impl DiskProfile {
 		let config_dir = crate::shared::config_dir();
 		let mut iter = path.strip_prefix(config_dir).unwrap().iter();
 		let _ = iter.nth(1);
-		let mut id = iter.map(|x| x.to_string_lossy()).collect::<Vec<_>>().join("/");
-		id = id[..id.len() - 5].to_owned();
+		let id = iter.map(|x| x.to_string_lossy()).collect::<Vec<_>>().join("/");
 		Profile {
-			id,
+			id: strip_storage_suffix(&id).to_owned(),
 			keys: self.keys.into_iter().map(|x| x.map(|v| v.into_action_instance(path))).collect(),
 			sliders: self.sliders.into_iter().map(|x| x.map(|v| v.into_action_instance(path))).collect(),
 			infobars: self.infobars.into_iter().map(|x| x.map(|v| v.into_action_instance(path))).collect(),

@@ -12,6 +12,9 @@ pub mod will_appear;
 use futures::SinkExt;
 use serde::Serialize;
 
+/// Backlog retained for a plugin or property inspector that is not currently connected.
+const MAX_QUEUED_MESSAGES: usize = 64;
+
 #[derive(Serialize)]
 struct Coordinates {
 	row: u8,
@@ -58,15 +61,15 @@ async fn send_to_plugin(plugin: &str, data: &impl Serialize) -> Result<(), anyho
 	let message = tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(data)?.into());
 	let mut sockets = super::PLUGIN_SOCKETS.lock().await;
 
-	if let Some(socket) = sockets.get_mut(plugin) {
+	if let Some((_, socket)) = sockets.get_mut(plugin) {
 		socket.send(message).await?;
 	} else {
 		let mut queues = super::PLUGIN_QUEUES.write().await;
-		if queues.contains_key(plugin) {
-			queues.get_mut(plugin).unwrap().push(message);
-		} else {
-			queues.insert(plugin.to_owned(), vec![message]);
+		let queue = queues.entry(plugin.to_owned()).or_default();
+		if queue.len() >= MAX_QUEUED_MESSAGES {
+			queue.remove(0);
 		}
+		queue.push(message);
 	}
 
 	Ok(())
@@ -87,20 +90,20 @@ async fn send_to_all_plugins(data: &impl Serialize) -> Result<(), anyhow::Error>
 	Ok(())
 }
 
-#[allow(clippy::map_entry)]
 async fn send_to_property_inspector(context: &crate::shared::ActionContext, data: &impl Serialize) -> Result<(), anyhow::Error> {
 	let message = tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(data)?.into());
+	let key = context.to_string();
 	let mut sockets = super::PROPERTY_INSPECTOR_SOCKETS.lock().await;
 
-	if let Some(socket) = sockets.get_mut(&context.to_string()) {
+	if let Some((_, socket)) = sockets.get_mut(&key) {
 		socket.send(message).await?;
 	} else {
 		let mut queues = super::PROPERTY_INSPECTOR_QUEUES.write().await;
-		if queues.contains_key(&context.to_string()) {
-			queues.get_mut(&context.to_string()).unwrap().push(message);
-		} else {
-			queues.insert(context.to_string(), vec![message]);
+		let queue = queues.entry(key).or_default();
+		if queue.len() >= MAX_QUEUED_MESSAGES {
+			queue.remove(0);
 		}
+		queue.push(message);
 	}
 
 	Ok(())

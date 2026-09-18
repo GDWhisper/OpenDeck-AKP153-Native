@@ -514,6 +514,9 @@ pub fn initialise_plugins() {
 	});
 }
 
+/// Time a connecting peer gets to complete the WebSocket handshake and send its registration event.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Start the WebSocket server that plugins communicate with.
 async fn init_websocket_server() {
 	let listener = match TcpListener::bind(format!("0.0.0.0:{}", *PORT_BASE)).await {
@@ -532,25 +535,41 @@ async fn init_websocket_server() {
 		unsafe { SetHandleInformation(listener.as_raw_socket() as _, HANDLE_FLAG_INHERIT, 0) };
 	}
 
-	while let Ok((stream, _)) = listener.accept().await {
-		accept_connection(stream).await;
+	loop {
+		match listener.accept().await {
+			Ok((stream, _)) => {
+				tokio::spawn(accept_connection(stream));
+			}
+			Err(error) => {
+				warn!("Failed to accept plugin WebSocket connection: {}", error);
+				// Persistently failing accepts (e.g. descriptor pressure) would otherwise spin here.
+				tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+			}
+		}
 	}
 }
 
 /// Handle incoming data from a WebSocket connection.
 async fn accept_connection(stream: TcpStream) {
-	let mut socket = match tokio_tungstenite::accept_async(stream).await {
-		Ok(socket) => socket,
-		Err(error) => {
+	let mut socket = match tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::accept_async(stream)).await {
+		Ok(Ok(socket)) => socket,
+		Ok(Err(error)) => {
 			warn!("Failed to complete WebSocket handshake: {}", error);
 			return;
 		}
+		Err(_) => return,
 	};
 
-	let Ok(register_event) = socket.next().await.unwrap() else {
-		return;
+	let register_event = match tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.next()).await {
+		Ok(Some(Ok(event))) => event,
+		Ok(Some(Err(_))) | Ok(None) | Err(_) => return,
 	};
-	match serde_json::from_str(&register_event.clone().into_text().unwrap()) {
+
+	let text = match register_event.clone().into_text() {
+		Ok(text) => text,
+		Err(_) => return,
+	};
+	match serde_json::from_str(&text) {
 		Ok(event) => crate::events::register_plugin(event, socket).await,
 		Err(_) => {
 			let _ = crate::events::inbound::process_incoming_message(Ok(register_event), "", false).await;

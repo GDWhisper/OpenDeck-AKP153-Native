@@ -78,7 +78,7 @@ impl ProfileStores {
 				let _ = initialise_encoder_layout(&mut instance.action, None);
 			}
 
-			store.save()?;
+			store.save_async().await?;
 
 			self.stores.insert(canonical_id.clone(), store);
 			Ok(self.stores.get_mut(&canonical_id).unwrap())
@@ -96,6 +96,8 @@ impl ProfileStores {
 		let id = &id.replace('/', "\\");
 		let path = config_dir.join("profiles").join(device).join(format!("{id}.json"));
 		let _ = fs::remove_file(&path);
+		let _ = fs::remove_file(path.with_extension("json.bak"));
+		let _ = fs::remove_file(path.with_extension("json.temp"));
 		// This is safe as `remove_dir` errors if the directory is not empty.
 		let _ = fs::remove_dir(path.parent().unwrap());
 		let images_path = config_dir.join("images").join(device).join(id);
@@ -131,6 +133,12 @@ impl ProfileStores {
 
 		// Rename the profile file
 		if !retain {
+			// Leftover siblings would resurrect the wrong profile, or outlive the renamed one
+			for path in [&old_path, &new_path] {
+				let _ = fs::remove_file(path.with_extension("json.bak"));
+				let _ = fs::remove_file(path.with_extension("json.temp"));
+			}
+
 			fs::rename(&old_path, &new_path)?;
 
 			// Clean up empty old directory if profile was in a folder
@@ -244,31 +252,22 @@ pub fn get_device_profiles(device: &str) -> Result<Vec<String>, anyhow::Error> {
 
 	for entry in entries.flatten() {
 		if entry.metadata()?.is_file() {
+			// `.json.bak` and `.json.temp` are recovery artefacts handled by Store::new, not profiles
 			let mut id = entry.file_name().to_string_lossy().into_owned();
-			if id.ends_with(".json") {
-				id.truncate(id.len() - 5);
-			} else if id.ends_with(".json.bak") {
-				id.truncate(id.len() - 9);
-			} else if id.ends_with(".json.temp") {
-				id.truncate(id.len() - 10);
-			} else {
+			if !id.ends_with(".json") {
 				continue;
 			}
+			id.truncate(id.len() - 5);
 			profiles.push(id);
 		} else if entry.metadata()?.is_dir() {
 			let entries = fs::read_dir(entry.path())?;
 			for subentry in entries.flatten() {
 				if subentry.metadata()?.is_file() {
 					let mut id = format!("{}/{}", entry.file_name().to_string_lossy(), &subentry.file_name().to_string_lossy());
-					if id.ends_with(".json") {
-						id.truncate(id.len() - 5);
-					} else if id.ends_with(".json.bak") {
-						id.truncate(id.len() - 9);
-					} else if id.ends_with(".json.temp") {
-						id.truncate(id.len() - 10);
-					} else {
+					if !id.ends_with(".json") {
 						continue;
 					}
+					id.truncate(id.len() - 5);
 					profiles.push(id);
 				}
 			}
@@ -373,7 +372,7 @@ pub async fn save_profile(device: &str, locks: &mut LocksMut<'_>) -> Result<(), 
 	let selected_profile = locks.device_stores.get_selected_profile(device)?;
 	let device = DEVICES.get(device).ok_or_else(|| anyhow!("device not found"))?;
 	let store = locks.profile_stores.get_profile_store(&device, &selected_profile)?;
-	store.save()
+	store.save_async().await
 }
 
 pub static PROFILE_SAVE_DEBOUNCE: LazyLock<DashMap<crate::shared::ActionContext, JoinHandle<()>>> = LazyLock::new(DashMap::new);

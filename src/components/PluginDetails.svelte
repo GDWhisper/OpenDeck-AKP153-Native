@@ -8,7 +8,7 @@
 
 	import { invoke } from "@tauri-apps/api/core";
 	import DOMPurify from "dompurify";
-	import { marked } from "marked";
+	import { Marked, Renderer } from "marked";
 	import markedAlert from "marked-alert";
 	import { baseUrl } from "marked-base-url";
 	import { onMount } from "svelte";
@@ -25,9 +25,10 @@
 	const fetch = window.fetchNative ?? window.fetch;
 
 	async function getReadme(repo: string): Promise<string> {
-		const renderer = new marked.Renderer();
+		const marked = new Marked();
+		const renderer = new Renderer();
 		renderer.link = function (token) {
-			const rendered = marked.Renderer.prototype.link.call(this, token);
+			const rendered = Renderer.prototype.link.call(this, token);
 			return rendered.replace("<a", `<a target="_blank" `);
 		};
 		marked.use({ renderer });

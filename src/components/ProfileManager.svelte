@@ -14,7 +14,9 @@
 
 	import { invoke } from "@tauri-apps/api/core";
 	import { listen } from "@tauri-apps/api/event";
+	import type { UnlistenFn } from "@tauri-apps/api/event";
 	import { message } from "@tauri-apps/plugin-dialog";
+	import { onDestroy } from "svelte";
 
 	let folders: { [name: string]: string[] } = {};
 	let value: string;
@@ -53,11 +55,28 @@
 		$inspectedInstance = null;
 	}
 
-	listen("rerender_images", async () => {
-		try {
-			profile = await invoke("get_selected_profile", { device: device.id });
-		} catch {}
+	let unlisteners: UnlistenFn[] = [];
+	let destroyed = false;
+	function keepUnlisten(promise: Promise<UnlistenFn>) {
+		void promise.then((unlisten) => {
+			if (destroyed) unlisten();
+			else unlisteners.push(unlisten);
+		});
+	}
+
+	onDestroy(() => {
+		destroyed = true;
+		unlisteners.forEach((unlisten) => unlisten());
+		unlisteners = [];
 	});
+
+	keepUnlisten(
+		listen("rerender_images", async () => {
+			try {
+				profile = await invoke("get_selected_profile", { device: device.id });
+			} catch {}
+		}),
+	);
 
 	async function deleteProfile(id: string) {
 		for (const devices of Object.values(applicationProfiles)) {
@@ -161,7 +180,7 @@
 		applications = await invoke("get_applications");
 		applicationProfiles = await invoke("get_application_profiles");
 	})();
-	listen("applications", ({ payload }: { payload: string[] }) => (applications = payload));
+	keepUnlisten(listen("applications", ({ payload }: { payload: string[] }) => (applications = payload)));
 	let applicationsAddAppName: string = "opendeck_select_application";
 	let applicationsAddProfile: string = "opendeck_select_profile";
 	$: {
