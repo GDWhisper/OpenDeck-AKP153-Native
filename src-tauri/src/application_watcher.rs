@@ -28,11 +28,17 @@ pub fn init_application_watcher() {
 		let mut previous = String::new();
 		let app_handle = crate::APP_HANDLE.get().unwrap();
 		loop {
+			if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+				break;
+			}
+
 			let app_name = if let Ok(win) = get_active_window() {
 				let mut applications = APPLICATIONS.write().await;
 				if !applications.contains(&win.app_name) && !win.app_name.to_lowercase().starts_with(&crate::shared::PRODUCT_NAME.to_lowercase()) && !win.app_name.trim().is_empty() {
 					applications.push(win.app_name.clone());
-					let _ = app_handle.get_webview_window("main").unwrap().emit("applications", applications.clone());
+					if let Some(window) = app_handle.get_webview_window("main") {
+						let _ = window.emit("applications", applications.clone());
+					}
 				}
 				win.app_name
 			} else {
@@ -51,7 +57,10 @@ pub fn init_application_watcher() {
 					if crate::store::profiles::DEVICE_STORES.write().await.get_selected_profile(device).ok().as_ref() == Some(profile) {
 						continue;
 					}
-					let _ = app_handle.get_webview_window("main").unwrap().emit(
+					let Some(window) = app_handle.get_webview_window("main") else {
+						continue;
+					};
+					let _ = window.emit(
 						"switch_profile",
 						SwitchProfileEvent {
 							device: device.clone(),

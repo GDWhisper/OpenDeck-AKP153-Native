@@ -22,6 +22,7 @@ use events::frontend;
 use shared::PRODUCT_NAME;
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{
 	AppHandle, Builder, Manager, WindowEvent,
@@ -31,6 +32,10 @@ use tauri::{
 use tauri_plugin_log::{Target, TargetKind};
 
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+/// Set as soon as the event loop reaches its `Destroyed` state: tao panics on any message that is
+/// still posted to its event target window afterwards, so background loops must stop queueing work.
+pub static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn show_window(app: &AppHandle) -> Result<(), tauri::Error> {
 	#[cfg(target_os = "macos")]
@@ -445,12 +450,19 @@ If you have already donated, thank you so much for your support!"#,
 
 	app.run(|app, event| {
 		if let tauri::RunEvent::Exit = event {
+			SHUTTING_DOWN.store(true, Ordering::SeqCst);
 			#[cfg(windows)]
 			futures::executor::block_on(plugins::deactivate_plugins());
-			tokio::spawn(elgato::reset_devices());
-			tokio::spawn(mirajazz::reset_devices());
+			futures::executor::block_on(store::profiles::flush_debounced_saves());
+			let _ = futures::executor::block_on(tokio::time::timeout(
+				std::time::Duration::from_secs(2),
+				futures::future::join(elgato::reset_devices(), mirajazz::reset_devices()),
+			));
 			use tauri_plugin_aptabase::EventTracker;
 			app.flush_events_blocking();
+			// Returning would hand control back to tao's message pump with the runner already destroyed.
+			#[cfg(windows)]
+			std::process::exit(0);
 		}
 	});
 }

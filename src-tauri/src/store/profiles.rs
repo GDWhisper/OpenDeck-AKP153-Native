@@ -392,3 +392,27 @@ pub fn debounce_profile_save(context: crate::shared::ActionContext) {
 		}),
 	);
 }
+
+/// Write out profiles whose debounced save was still pending, so an exit doesn't drop the last edits.
+pub async fn flush_debounced_saves() {
+	let mut devices: Vec<String> = Vec::new();
+	for context in PROFILE_SAVE_DEBOUNCE.iter().map(|entry| entry.key().clone()).collect::<Vec<_>>() {
+		if let Some((_, handle)) = PROFILE_SAVE_DEBOUNCE.remove(&context) {
+			handle.abort();
+		}
+		if !devices.contains(&context.device) {
+			devices.push(context.device);
+		}
+	}
+
+	if devices.is_empty() {
+		return;
+	}
+
+	let mut locks = acquire_locks_mut().await;
+	for device in devices {
+		if let Err(error) = save_profile(&device, &mut locks).await {
+			log::debug!("Failed to flush profile save for device {device}: {error}");
+		}
+	}
+}
