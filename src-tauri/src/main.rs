@@ -12,6 +12,7 @@ mod shared;
 mod store;
 #[cfg(windows)]
 mod usb_power;
+mod webview_guard;
 mod zip_extract;
 
 mod built_info {
@@ -77,7 +78,7 @@ fn wait_for_process_exit(pid: u32) {
 	}
 }
 
-fn restart_app(app: &AppHandle) {
+pub(crate) fn restart_app(app: &AppHandle) {
 	#[cfg(target_os = "windows")]
 	{
 		let exe = match std::env::current_exe() {
@@ -90,11 +91,22 @@ fn restart_app(app: &AppHandle) {
 		};
 		let pid = std::process::id();
 
-		if let Err(e) = std::process::Command::new(&exe)
-			.arg("--restart-helper")
-			.arg(pid.to_string())
-			.spawn()
-		{
+		// An automatic recovery restart happens while the app usually sits in the
+		// tray; re-showing the window would steal focus from whatever the user is
+		// doing. Preserve the pre-restart visibility instead.
+		let hidden = app
+			.get_webview_window("main")
+			.and_then(|window| window.is_visible().ok())
+			.map(|visible| !visible)
+			.unwrap_or(false);
+
+		let mut command = std::process::Command::new(&exe);
+		command.arg("--restart-helper").arg(pid.to_string());
+		if hidden {
+			command.arg("--hide");
+		}
+
+		if let Err(e) = command.spawn() {
 			log::error!("Failed to spawn restart helper: {e}");
 			app.exit(1);
 			return;
@@ -118,7 +130,11 @@ async fn main() {
 			}
 		}
 		if let Ok(exe) = std::env::current_exe() {
-			let _ = std::process::Command::new(exe).spawn();
+			let mut command = std::process::Command::new(exe);
+			if args.len() > pos + 2 {
+				command.args(&args[pos + 2..]);
+			}
+			let _ = command.spawn();
 		}
 		return;
 	}
@@ -174,13 +190,13 @@ async fn main() {
 		.setup(|app| {
 			APP_HANDLE.set(app.handle().clone()).unwrap();
 
-			#[cfg(windows)]
-			if !std::env::args().any(|v| v == "--hide") {
-				let _ = app.get_webview_window("main").unwrap().show();
-			}
-			#[cfg(not(windows))]
-			if std::env::args().any(|v| v == "--hide") {
+			let hidden = std::env::args().any(|v| v == "--hide");
+			if hidden {
 				let _ = hide_window(app.handle());
+			}
+			#[cfg(windows)]
+			if !hidden {
+				let _ = app.get_webview_window("main").unwrap().show();
 			}
 
 			let old = app.path().config_dir().unwrap().join("com.amansprojects.opendeck");
@@ -268,6 +284,7 @@ If you have already donated, thank you so much for your support!"#,
 			application_watcher::init_application_watcher();
 			device_sleep::init_device_sleep();
 			power_events::init_power_events();
+			webview_guard::install(app.handle());
 
 			let label = IconMenuItemBuilder::with_id("label", PRODUCT_NAME)
 				.icon(app.default_window_icon().unwrap().clone())

@@ -1,6 +1,11 @@
 {
 	"action_list.hint": "Use arrow keys to navigate between actions within a category.",
 	"action_list.search_placeholder": "Search actions",
+	"device_recovery.dismiss": "Dismiss",
+	"device_recovery.failed": "{{name}} stopped responding and could not be reset automatically. Unplug and replug the device, or restart {{PRODUCT_NAME}}.",
+	"device_recovery.recovered": "{{name}} is responding again.",
+	"device_recovery.resetting": "{{name}} stopped responding. Restarting its USB connection...",
+	"device_recovery.restarting": "{{name}} is still unresponsive. Restarting {{PRODUCT_NAME}} to recover it...",
 	"device_selector.choose_device": "Choose a device...",
 	"device_selector.device": "Device",
 	"device_view.encoder": "Encoder",

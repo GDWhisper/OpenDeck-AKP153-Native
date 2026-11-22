@@ -125,6 +125,29 @@ impl<T> IoBuffer<T> {
             }
         }
     }
+
+    /// Waits a bounded amount of time for a cancelled operation to finish.
+    /// Returns `false` when the device never completes it.
+    fn wait_for_completion_briefly(&self) -> bool {
+        const WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + WAIT_BUDGET;
+
+        loop {
+            let mut bytes_transferred = 0;
+            let result = unsafe { GetOverlappedResult(self.device.handle(), self.overlapped.as_raw(), &mut bytes_transferred, false) };
+            match result {
+                Ok(()) => return true,
+                Err(err) if err.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                // The operation completed with an error, so the kernel is done with the buffer.
+                Err(_) => return true,
+            }
+        }
+    }
 }
 
 impl<T> Drop for IoBuffer<T> {
@@ -138,10 +161,15 @@ impl<T> Drop for IoBuffer<T> {
                 error!("Failed to cancel pending I/O operation, leaking buffers: {err:?}");
                 return;
             }
-            // CancelIoEx only requests cancellation; wait for the operation to actually finish
-            // before freeing the buffers to avoid a use-after-free.
-            let mut bytes_transferred = 0;
-            let _ = unsafe { GetOverlappedResult(self.device.handle(), self.overlapped.as_raw(), &mut bytes_transferred, true) };
+            // CancelIoEx only requests cancellation. Waiting for a wedged device to finish its
+            // IRP would block forever, and the handle stays open while we wait: an open handle
+            // makes the PnP manager refuse to remove the device node (ERROR_REBOOT_REQUIRED),
+            // so recovery would need a full process restart. Wait briefly instead, then leak
+            // the buffers so the handle is released.
+            if !self.wait_for_completion_briefly() {
+                error!("Pending I/O did not complete, leaking buffers to release the HID handle");
+                return;
+            }
             self.pending = false;
         }
         // Free the buffers on the normal path too (previously they were leaked whenever

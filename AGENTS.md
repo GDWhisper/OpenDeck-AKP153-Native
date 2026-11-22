@@ -170,6 +170,17 @@ Plugins: <config_dir>/plugins/
 
 Flatpak uses different paths with `~/.var/app/me.amankhanna.opendeck/` prefix.
 
+## Building & Deploying
+
+### Release Builds
+
+- **Always enable `custom-protocol`.** Without it, Tauri loads `devUrl` (`http://localhost:5173`) instead of embedded assets, and the window shows `ERR_CONNECTION_REFUSED`.
+- Preferred: `deno task tauri build` (builds frontend, enables `custom-protocol`).
+- Manual: `deno task build`, then `cargo build --release --features custom-protocol` in `src-tauri/`.
+- Sanity check: embedded binary is ~50 MB. A ~30 MB binary has no frontend assets.
+- Deploy: stop the running `opendeck.exe` before replacing it.
+- Verify: open the app and confirm the UI loads, not a localhost error page.
+
 ## Testing & Debugging
 
 - Run from terminal to see live logs: `deno task tauri dev`

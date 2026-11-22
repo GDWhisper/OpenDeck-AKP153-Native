@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use dashmap::DashMap;
@@ -9,6 +10,7 @@ use mirajazz::device::{Device, DeviceQuery, list_devices};
 use mirajazz::error::MirajazzError;
 use mirajazz::state::{DeviceStateReader, DeviceStateUpdate};
 use mirajazz::types::{DeviceInput, ImageFormat, ImageMirroring, ImageMode, ImageRotation};
+use tauri::Emitter;
 use tokio::sync::RwLock;
 
 use crate::events::inbound;
@@ -20,6 +22,29 @@ const AKP153_VID: u16 = 0x5548;
 const AKP153_PID: u16 = 0x6674;
 
 const AKP153_QUERY: DeviceQuery = DeviceQuery::new(65440, 1, AKP153_VID, AKP153_PID);
+
+const DEVICE_NAME: &str = "Ajazz AKP153";
+
+/// Consecutive setup timeouts after which the USB device node is reset. The
+/// polling loop retries every 10s, so this waits roughly 30s before escalating.
+const SETUP_TIMEOUTS_BEFORE_RESET: u32 = 3;
+
+/// How long the device gets to come back after its node was reset. The only
+/// reconnect path is the 10s polling loop, plus a full setup budget (30s) and
+/// the margin for a power-management fix restarting the node once more.
+const RECOVERY_REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+const RECOVERY_EVENT: &str = "device_recovery";
+
+/// Restarting the application is the last resort: a stuck HID pipe can only be
+/// released by exiting the process. The counter bounds how many consecutive
+/// restarts a device that stays wedged may trigger before we give up.
+const MAX_RECOVERY_RESTARTS: u32 = 3;
+const RECOVERY_RESTART_MARKER: &str = ".akp153_recovery_restart_count";
+const RECOVERY_PENDING_MARKER: &str = ".akp153_recovery_pending";
+const RECOVERY_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+static STARTUP_RECOVERY_CHECKED: AtomicBool = AtomicBool::new(false);
 
 #[allow(dead_code)]
 const ROW_COUNT: u8 = 3;
@@ -42,6 +67,22 @@ static DEVICE_GENERATIONS: LazyLock<DashMap<String, u64>> = LazyLock::new(DashMa
 /// Tracks device IDs that currently have an active init task running.
 /// Prevents spawning duplicate init tasks that would open competing HID handles.
 static ACTIVE_INIT_TASKS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// Consecutive setup timeouts per device. Cleared when setup succeeds.
+static SETUP_TIMEOUTS: LazyLock<DashMap<String, u32>> = LazyLock::new(DashMap::new);
+
+/// Devices for which an automatic USB reset has already been attempted. Removed
+/// on successful setup so a later wedge in the same run can recover again.
+static RECOVERY_ATTEMPTED: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// Devices with a recovery in flight. The polling loop must not open a new HID
+/// handle while the device node is being re-enumerated.
+static RECOVERY_ACTIVE: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// Devices that have been registered at least once in this process. A device
+/// that worked and then fails is wedged, so recovery starts immediately instead
+/// of waiting for a fresh connect to time out repeatedly.
+static REGISTERED_DEVICES: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
 
 const FLUSH_DEBOUNCE_MS: u64 = 200;
 
@@ -96,10 +137,20 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// Setup clears 18 images, sets the brightness and flushes, which is hundreds of
+/// HID reports. A slow but healthy device must not be torn down for exceeding
+/// the connect budget, so setup gets its own, much larger timeout.
+const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Upper bound for any single HID operation. A wedged device can leave a write
 /// pending forever, silently freezing the flush task while the process stays
 /// healthy; a timeout converts that into a wedge + reconnect via the polling loop.
 const HID_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A flush writes every cached image, so it needs a far larger budget than a
+/// single control command. Aborting a flush mid-transfer is what pushes the
+/// device firmware into its wedged state.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn setup_device(device: &Device, device_id: &str) -> Result<Arc<DeviceStateReader>, MirajazzError> {
 	log::info!("mirajazz [{device_id}]: setup step 1/4: clear_all_button_images");
@@ -123,6 +174,179 @@ fn cleanup_device_state(device_id: &str) {
 	FLUSH_SIGNALS.remove(device_id);
 }
 
+fn emit_recovery_event(state: &str) {
+	if let Some(app) = crate::APP_HANDLE.get() {
+		let _ = app.emit(RECOVERY_EVENT, serde_json::json!({ "state": state, "name": DEVICE_NAME }));
+	}
+}
+
+fn note_setup_timeout(device_id: &str) {
+	let mut entry = SETUP_TIMEOUTS.entry(device_id.to_owned()).or_insert(0);
+	*entry += 1;
+	let count = *entry;
+	drop(entry);
+
+	log::warn!("mirajazz [{device_id}]: initial setup timed out ({count}/{SETUP_TIMEOUTS_BEFORE_RESET})");
+}
+
+fn should_attempt_recovery(device_id: &str) -> bool {
+	if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+		return false;
+	}
+
+	// A device that already worked and now times out is wedged: escalate at once.
+	// A device that never worked gets a few attempts, so a slow start is not
+	// mistaken for a broken one.
+	let threshold = if REGISTERED_DEVICES.contains(device_id) { 1 } else { SETUP_TIMEOUTS_BEFORE_RESET };
+	let threshold_reached = SETUP_TIMEOUTS.get(device_id).map(|count| *count >= threshold).unwrap_or(false);
+	threshold_reached && RECOVERY_ATTEMPTED.insert(device_id.to_owned())
+}
+
+async fn reset_usb_device() -> Result<(), String> {
+	#[cfg(windows)]
+	{
+		crate::usb_power::reset_akp153_devices().await
+	}
+	#[cfg(not(windows))]
+	{
+		Err("automatic USB reset is only supported on Windows".to_owned())
+	}
+}
+
+/// Runs once per process, before any HID handle is opened. A previous process
+/// wrote the pending marker just before restarting because pnputil cannot clear
+/// a device node that still owns a stuck I/O request.
+async fn run_pending_startup_recovery() {
+	if STARTUP_RECOVERY_CHECKED.swap(true, Ordering::SeqCst) {
+		return;
+	}
+
+	let pending = crate::shared::config_dir().join(RECOVERY_PENDING_MARKER);
+	let recent = std::fs::metadata(&pending)
+		.and_then(|metadata| metadata.modified())
+		.map(|modified| modified.elapsed().map(|elapsed| elapsed < RECOVERY_PENDING_TTL).unwrap_or(false))
+		.unwrap_or(false);
+
+	if !recent {
+		let _ = std::fs::remove_file(&pending);
+		return;
+	}
+
+	log::warn!("mirajazz: running pending AKP153 device node reset after recovery restart");
+	emit_recovery_event("resetting");
+
+	match reset_usb_device().await {
+		Ok(()) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+		Err(error) => log::error!("mirajazz: pending AKP153 device node reset failed: {error}"),
+	}
+
+	let _ = std::fs::remove_file(&pending);
+}
+
+fn restart_app_for_recovery() -> bool {
+	let marker = crate::shared::config_dir().join(RECOVERY_RESTART_MARKER);
+
+	let mut attempts: u32 = std::fs::read_to_string(&marker)
+		.ok()
+		.and_then(|content| content.trim().parse::<u32>().ok())
+		.unwrap_or(0);
+
+	if attempts >= MAX_RECOVERY_RESTARTS {
+		log::error!("mirajazz: recovery restart limit reached ({attempts}/{MAX_RECOVERY_RESTARTS}), giving up until the device recovers on its own");
+		return false;
+	}
+
+	let Some(app) = crate::APP_HANDLE.get() else { return false };
+
+	attempts += 1;
+	let _ = std::fs::write(&marker, attempts.to_string());
+
+	#[cfg(windows)]
+	if let Err(error) = std::fs::write(crate::shared::config_dir().join(RECOVERY_PENDING_MARKER), attempts.to_string()) {
+		log::error!("mirajazz: failed to persist pending recovery marker: {error}");
+		return false;
+	}
+
+	log::warn!("mirajazz: restarting OpenDeck to clear the wedged HID pipe ({attempts}/{MAX_RECOVERY_RESTARTS})");
+	crate::restart_app(app);
+	true
+}
+
+/// The HID endpoint is wedged: reopening the handle no longer works, so ask the
+/// OS to re-enumerate the device node. Runs once per wedge episode.
+fn schedule_usb_recovery(device_id: String) {
+	log::error!("mirajazz [{device_id}]: setup keeps timing out, resetting AKP153 USB device node");
+	emit_recovery_event("resetting");
+
+	RECOVERY_ACTIVE.insert(device_id.clone());
+
+	tokio::spawn(async move {
+		// Give the init task a moment to drop its HID handles before re-enumerating.
+		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+		// The device may simply have been unplugged; resetting the USB node and
+		// restarting the application would be pointless then.
+		match list_devices(&[AKP153_QUERY]).await {
+			Ok(devices) if devices.is_empty() => {
+				log::warn!("mirajazz [{device_id}]: device is not enumerated, waiting for it to come back");
+				RECOVERY_ACTIVE.remove(&device_id);
+				RECOVERY_ATTEMPTED.remove(&device_id);
+				return;
+			}
+			Ok(_) => {}
+			Err(error) => log::warn!("mirajazz [{device_id}]: enumeration check failed: {error}"),
+		}
+
+		// Removing the device node only works once the process no longer owns a
+		// stuck HID handle; otherwise the PnP manager reports ERROR_REBOOT_REQUIRED.
+		// The handles are released now that dropping them no longer waits on the
+		// wedged IRP, so the reset can happen without restarting the application.
+		match reset_usb_device().await {
+			Ok(()) => {
+				// The polling loop is the only path that opens a HID handle, and it
+				// skips devices marked RECOVERY_ACTIVE. Keeping the mark would make
+				// this wait unable to succeed, so release it before waiting.
+				RECOVERY_ACTIVE.remove(&device_id);
+
+				let wait_secs = RECOVERY_REGISTER_TIMEOUT.as_secs();
+				for _ in 0..wait_secs {
+					tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+					if crate::shared::DEVICES.contains_key(&device_id) {
+						log::info!("mirajazz [{device_id}]: recovered after USB device node reset");
+						return;
+					}
+				}
+				log::error!("mirajazz [{device_id}]: USB device was reset but did not re-register");
+				// The device is gone from the bus entirely, so it has to be plugged
+				// back in; restarting the application would not change that.
+				if let Ok(devices) = list_devices(&[AKP153_QUERY]).await
+					&& devices.is_empty()
+				{
+					log::warn!("mirajazz [{device_id}]: device is no longer enumerated, waiting for it to be plugged back in");
+					RECOVERY_ATTEMPTED.remove(&device_id);
+					emit_recovery_event("failed");
+					return;
+				}
+				// The reset alone was not enough, fall through to restarting the app.
+				if restart_app_for_recovery() {
+					emit_recovery_event("restarting");
+				} else {
+					emit_recovery_event("failed");
+				}
+			}
+			Err(error) => {
+				log::warn!("mirajazz [{device_id}]: USB device reset failed: {error}");
+				RECOVERY_ACTIVE.remove(&device_id);
+				if restart_app_for_recovery() {
+					emit_recovery_event("restarting");
+				} else {
+					emit_recovery_event("failed");
+				}
+			}
+		}
+	});
+}
+
 /// Bump the generation counter for a device. Returns the new generation.
 fn bump_generation(device_id: &str) -> u64 {
 	let mut entry = DEVICE_GENERATIONS.entry(device_id.to_owned()).or_insert(0);
@@ -136,11 +360,19 @@ fn is_current_generation(device_id: &str, generation: u64) -> bool {
 }
 
 async fn safe_hid_op<T>(device_id: &str, op: impl Future<Output = Result<T, MirajazzError>>) -> Option<T> {
+	safe_hid_op_with_timeout(device_id, HID_OP_TIMEOUT, op).await
+}
+
+async fn safe_hid_op_with_timeout<T>(
+	device_id: &str,
+	timeout: std::time::Duration,
+	op: impl Future<Output = Result<T, MirajazzError>>,
+) -> Option<T> {
 	if WEDGED_DEVICES.contains(device_id) {
 		return None;
 	}
 
-	match tokio::time::timeout(HID_OP_TIMEOUT, AssertUnwindSafe(op).catch_unwind()).await {
+	match tokio::time::timeout(timeout, AssertUnwindSafe(op).catch_unwind()).await {
 		Ok(Ok(Ok(result))) => Some(result),
 		Ok(Ok(Err(e))) => {
 			log::warn!("mirajazz [{device_id}]: HID error: {e}");
@@ -157,7 +389,7 @@ async fn safe_hid_op<T>(device_id: &str, op: impl Future<Output = Result<T, Mira
 			None
 		}
 		Err(_elapsed) => {
-			log::error!("mirajazz [{device_id}]: HID operation timed out after {HID_OP_TIMEOUT:?}");
+			log::error!("mirajazz [{device_id}]: HID operation timed out after {timeout:?}");
 			if WEDGED_DEVICES.contains(device_id) {
 				return None;
 			}
@@ -204,7 +436,7 @@ async fn flush_task(device: Arc<Device>, device_id: String, mut rx: tokio::sync:
 			continue;
 		}
 
-		safe_hid_op(&device_id, device.flush()).await;
+		safe_hid_op_with_timeout(&device_id, FLUSH_TIMEOUT, device.flush()).await;
 	}
 }
 
@@ -253,7 +485,7 @@ async fn try_reconnect(device_id: &str, generation: u64) -> Option<Arc<DeviceSta
 		};
 
 		let connect_result = tokio::time::timeout(
-			CONNECT_TIMEOUT,
+			SETUP_TIMEOUT,
 			AssertUnwindSafe(async {
 				let new_device = Device::connect(dev, 1, KEY_COUNT, ENCODER_COUNT).await?;
 				let reader = setup_device(&new_device, device_id).await?;
@@ -308,9 +540,11 @@ impl Drop for ActiveInitGuard {
 async fn init(device: Arc<Device>, device_id: String, _active: ActiveInitGuard) {
 	let generation = bump_generation(&device_id);
 
-	let result = init_inner(device, device_id.clone(), generation).await;
+	let result = init_inner(device.clone(), device_id.clone(), generation).await;
 
-	if !is_current_generation(&device_id, generation) {
+	let is_current = is_current_generation(&device_id, generation);
+
+	if !is_current {
 		log::info!("mirajazz [{device_id}]: stale init (gen {generation}), skipping cleanup");
 	} else {
 		if matches!(result, InitResult::Wedged) {
@@ -324,7 +558,16 @@ async fn init(device: Arc<Device>, device_id: String, _active: ActiveInitGuard) 
 		DEVICE_GENERATIONS.remove_if(&device_id, |_, v| *v == generation);
 	}
 
+	let recovery_due = is_current && should_attempt_recovery(&device_id);
+
 	log::info!("mirajazz [{device_id}]: device task ended (gen {generation})");
+
+	if recovery_due {
+		// Schedule first: dropping a device with a stuck write can block while the
+		// driver cancels the IRP, and recovery must not depend on that completing.
+		schedule_usb_recovery(device_id.clone());
+		drop(device);
+	}
 }
 
 enum InitResult {
@@ -333,7 +576,7 @@ enum InitResult {
 }
 
 async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> InitResult {
-	let reader = match tokio::time::timeout(CONNECT_TIMEOUT, AssertUnwindSafe(setup_device(&device, &device_id)).catch_unwind()).await {
+	let reader = match tokio::time::timeout(SETUP_TIMEOUT, AssertUnwindSafe(setup_device(&device, &device_id)).catch_unwind()).await {
 		Ok(Ok(Ok(reader))) => reader,
 		Ok(Ok(Err(e))) => {
 			log::warn!("mirajazz [{device_id}]: initial setup failed: {e}");
@@ -345,7 +588,9 @@ async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> 
 			return InitResult::Wedged;
 		}
 		Err(_) => {
-			log::warn!("mirajazz [{device_id}]: initial setup timed out");
+			if is_current_generation(&device_id, generation) {
+				note_setup_timeout(&device_id);
+			}
 			return InitResult::NormalExit;
 		}
 	};
@@ -359,7 +604,7 @@ async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> 
 			payload: crate::shared::DeviceInfo {
 				id: device_id.clone(),
 				plugin: String::new(),
-				name: "Ajazz AKP153".to_owned(),
+				name: DEVICE_NAME.to_owned(),
 				rows: 3,
 				columns: 6,
 				encoders: 0,
@@ -375,6 +620,17 @@ async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> 
 		MIRAJAZZ_DEVICES.write().await.remove(&device_id);
 		cleanup_device_state(&device_id);
 		return InitResult::NormalExit;
+	}
+
+	SETUP_TIMEOUTS.remove(&device_id);
+	REGISTERED_DEVICES.insert(device_id.clone());
+	let restart_marker = crate::shared::config_dir().join(RECOVERY_RESTART_MARKER);
+	// A recovery that was started by a previous process shows up as the marker
+	// file, one started by this process as the in-memory set.
+	if RECOVERY_ATTEMPTED.remove(&device_id).is_some() || restart_marker.exists() {
+		// The device works again, so the next wedge starts a fresh recovery cycle.
+		let _ = std::fs::remove_file(&restart_marker);
+		emit_recovery_event("recovered");
 	}
 
 	log::info!("mirajazz [{device_id}]: device registered, entering event loop");
@@ -406,6 +662,14 @@ async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> 
 
 				log::warn!("mirajazz [{device_id}]: fatal reader error: {e}, attempting reconnect");
 
+				if REGISTERED_DEVICES.contains(&device_id) {
+					// The device worked before and its pipe is now broken; reconnecting
+					// the same broken pipe only wastes time, so recover the device node.
+					log::error!("mirajazz [{device_id}]: reader failed on a working device, treating it as wedged");
+					handle_wedge(&device_id);
+					return InitResult::Wedged;
+				}
+
 				match try_reconnect(&device_id, generation).await {
 					Some(new_reader) => {
 						reader = new_reader;
@@ -435,6 +699,8 @@ async fn init_inner(device: Arc<Device>, device_id: String, generation: u64) -> 
 }
 
 pub async fn initialise_mirajazz_devices() {
+	run_pending_startup_recovery().await;
+
 	crate::plugins::DEVICE_NAMESPACES.write().await.insert(DEVICE_NAMESPACE.to_owned(), "opendeck_native_akp153".to_owned());
 
 	let devices = match list_devices(&[AKP153_QUERY]).await {
@@ -453,7 +719,16 @@ pub async fn initialise_mirajazz_devices() {
 	// AKP153 firmware deadlocks when Windows suspends it; self-heal the per-instance
 	// registry setting before (re)connecting. No-op once all instances are fixed.
 	#[cfg(windows)]
-	crate::usb_power::ensure_akp153_power_management();
+	{
+		crate::usb_power::ensure_akp153_power_management();
+		// The fix restarts the device node. Opening a handle while it runs would
+		// produce a spurious wedge and one more disconnect, so let the polling
+		// loop connect on a later tick.
+		if crate::usb_power::power_fix_in_progress() {
+			log::info!("mirajazz: waiting for the AKP153 power-management fix before connecting");
+			return;
+		}
+	}
 
 	for dev in &devices {
 		let serial = dev.serial_number.as_deref().unwrap_or("355499441494");
@@ -464,6 +739,12 @@ pub async fn initialise_mirajazz_devices() {
 		}
 
 		if ACTIVE_INIT_TASKS.contains(&device_id) {
+			continue;
+		}
+
+		// A recovery is re-enumerating the device node; opening a handle now would
+		// make the removal fail and the recovery pointless.
+		if RECOVERY_ACTIVE.contains(&device_id) {
 			continue;
 		}
 
@@ -504,6 +785,9 @@ pub async fn resume_from_sleep() {
 		log::info!("mirajazz [{device_id}]: bumping generation for resume from sleep");
 		generations.push((device_id.clone(), bump_generation(device_id)));
 		WEDGED_DEVICES.remove(device_id);
+		// Timeouts from before the sleep must not push the post-wake reconnect into
+		// the recovery path while USB is still re-enumerating.
+		SETUP_TIMEOUTS.remove(device_id);
 	}
 
 	if !device_ids.is_empty() {

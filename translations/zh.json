@@ -1,6 +1,11 @@
 {
 	"action_list.hint": "使用方向键在同一类别的动作之间导航。",
 	"action_list.search_placeholder": "搜索动作",
+	"device_recovery.dismiss": "关闭",
+	"device_recovery.failed": "{{name}} 无响应，自动复位失败。请拔插设备，或重启 {{PRODUCT_NAME}}。",
+	"device_recovery.recovered": "{{name}} 已恢复响应。",
+	"device_recovery.resetting": "{{name}} 无响应，正在重启其 USB 连接…",
+	"device_recovery.restarting": "{{name}} 仍无响应，正在重启 {{PRODUCT_NAME}} 以恢复…",
 	"device_selector.choose_device": "选择设备...",
 	"device_selector.device": "设备",
 	"device_view.encoder": "旋钮",

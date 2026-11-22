@@ -2,9 +2,14 @@
 	import type { DeviceInfo } from "$lib/DeviceInfo";
 	import type { Profile } from "$lib/Profile";
 
+	import { t } from "$lib/i18n";
 	import { initPortBase } from "$lib/ports";
 	import { inspectedParentAction } from "$lib/propertyInspector";
-	import { actionList, deviceSelector, profileManager } from "$lib/singletons";
+	import { PRODUCT_NAME, actionList, deviceSelector, profileManager } from "$lib/singletons";
+
+	import { listen } from "@tauri-apps/api/event";
+	import type { UnlistenFn } from "@tauri-apps/api/event";
+	import { onMount } from "svelte";
 
 	import ActionList from "../components/ActionList.svelte";
 	import DeviceSelector from "../components/DeviceSelector.svelte";
@@ -16,11 +21,37 @@
 	import PropertyInspectorView from "../components/PropertyInspectorView.svelte";
 	import SettingsView from "../components/SettingsView.svelte";
 
+	type RecoveryState = "resetting" | "restarting" | "recovered" | "failed";
+
 	let devices: { [id: string]: DeviceInfo } = {};
 	let selectedDevice: string;
 	let selectedProfiles: { [id: string]: Profile } = {};
+	let recovery: { state: RecoveryState; name: string } | null = null;
+	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
 
 	initPortBase();
+
+	onMount(() => {
+		let destroyed = false;
+		let unlisten: UnlistenFn | undefined;
+
+		listen<{ state: RecoveryState; name: string }>("device_recovery", ({ payload }) => {
+			clearTimeout(recoveryTimer);
+			recovery = payload;
+			if (payload.state === "recovered") {
+				recoveryTimer = setTimeout(() => (recovery = null), 4000);
+			}
+		}).then((fn) => {
+			if (destroyed) fn();
+			else unlisten = fn;
+		});
+
+		return () => {
+			destroyed = true;
+			unlisten?.();
+			clearTimeout(recoveryTimer);
+		};
+	});
 </script>
 
 <svelte:window on:dragover={(event) => event.preventDefault()} on:drop={(event) => event.preventDefault()} />
@@ -64,3 +95,20 @@
 
 	<ActionList bind:this={$actionList} />
 </div>
+
+{#if recovery}
+	<div
+		role="status"
+		class="fixed bottom-4 right-4 z-50 max-w-sm rounded-lg border border-neutral-600 bg-neutral-800 p-3 text-sm text-neutral-200 shadow-lg"
+	>
+		<p>{$t(`device_recovery.${recovery.state}`, { name: recovery.name, PRODUCT_NAME })}</p>
+		{#if recovery.state === "failed"}
+			<button
+				class="mt-2 px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 transition-colors border border-neutral-600 rounded-lg"
+				on:click={() => (recovery = null)}
+			>
+				{$t("device_recovery.dismiss")}
+			</button>
+		{/if}
+	</div>
+{/if}

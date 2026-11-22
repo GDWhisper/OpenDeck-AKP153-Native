@@ -1,6 +1,11 @@
 {
 	"action_list.hint": "Verwende die Pfeiltasten, um zwischen Aktionen innerhalb einer Kategorie zu navigieren.",
 	"action_list.search_placeholder": "Durchsuche Aktionen",
+	"device_recovery.dismiss": "Schließen",
+	"device_recovery.failed": "{{name}} reagiert nicht mehr und konnte nicht automatisch zurückgesetzt werden. Ziehe das Gerät ab und stecke es wieder ein oder starte {{PRODUCT_NAME}} neu.",
+	"device_recovery.recovered": "{{name}} reagiert wieder.",
+	"device_recovery.resetting": "{{name}} reagiert nicht mehr. USB-Verbindung wird neu gestartet...",
+	"device_recovery.restarting": "{{name}} reagiert weiterhin nicht. {{PRODUCT_NAME}} wird neu gestartet...",
 	"device_selector.choose_device": "Wähle ein Gerät...",
 	"device_selector.device": "Gerät",
 	"device_view.encoder": "Drehknauf",

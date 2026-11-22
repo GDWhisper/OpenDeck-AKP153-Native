@@ -63,6 +63,7 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 winreg = "0.55"
+webview2-com = "0.38"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
